@@ -87,14 +87,16 @@ const FaceScanAttendance = ({ isOpen, onClose }: FaceScanAttendanceProps) => {
       const data = imageData.data;
       
       let totalBrightness = 0;
-      for (let i = 0; i < data.length; i += 4) {
+      let sampleCount = 0;
+      for (let i = 0; i < data.length; i += 80) { // check every 20th pixel
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
         totalBrightness += (r + g + b) / 3;
+        sampleCount++;
       }
       
-      const avgBrightness = totalBrightness / (data.length / 4);
+      const avgBrightness = totalBrightness / sampleCount;
       setLightingOk(avgBrightness > 50 && avgBrightness < 230);
     };
 

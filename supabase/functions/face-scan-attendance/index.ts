@@ -6,51 +6,243 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Helper function to convert storage file to base64
-async function getImageAsBase64(supabase: any, faceImageUrl: string): Promise<string | null> {
+interface Candidate {
+  user_id: string;
+  full_name: string;
+  enrollment_number?: string;
+  roll_number?: string;
+  signedUrl: string;
+}
+
+// Compare a batch of candidates using Lovable/Gemini Gateway
+async function compareBatch(
+  capturedImage: string,
+  candidates: Candidate[],
+  lovableApiKey: string
+): Promise<{ matchedUserId: string | null; confidence: number; reason: string } | null> {
   try {
-    // Extract the path from the URL
-    // URL format: https://xxx.supabase.co/storage/v1/object/public/face-images/userId/filename.jpg
-    const urlParts = faceImageUrl.split('/storage/v1/object/public/');
-    if (urlParts.length !== 2) {
-      console.error('Invalid storage URL format:', faceImageUrl);
+    const contentList = [
+      {
+        type: "text",
+        text: "Below is the primary 'Captured Face' image, followed by the candidate images. Match the Captured Face against the candidate faces."
+      },
+      {
+        type: "text",
+        text: "=== Captured Face ==="
+      },
+      {
+        type: "image_url",
+        image_url: { url: capturedImage }
+      }
+    ];
+
+    candidates.forEach((candidate) => {
+      contentList.push({
+        type: "text",
+        text: `=== Candidate Face (User ID: ${candidate.user_id}) ===`
+      });
+      contentList.push({
+        type: "image_url",
+        image_url: { url: candidate.signedUrl }
+      });
+    });
+
+    const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${lovableApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "google/gemini-2.5-flash",
+        messages: [
+          {
+            role: "system",
+            content: `You are an extremely accurate face recognition system.
+Determine if the person in the "Captured Face" is the same person as one of the "Candidate Faces".
+
+Instructions:
+1. Examine the "Captured Face" image (labeled below).
+2. Examine the "Candidate Face" images (labeled below with their User IDs).
+3. Identify which Candidate Face (if any) is the same person as the Captured Face.
+4. Respond in JSON format only with:
+   - "matchedUserId": the User ID of the matching candidate, or null if no match is found.
+   - "confidence": confidence score from 0 to 100.
+   - "reason": brief explanation of why they match or why no match was found.
+
+IMPORTANT: Only return the JSON object, no other text.`
+          },
+          {
+            role: "user",
+            content: contentList
+          }
+        ],
+        response_format: { type: "json_object" }
+      }),
+    });
+
+    if (!aiResponse.ok) {
+      const errorText = await aiResponse.text();
+      console.error(`AI API batch error:`, errorText);
       return null;
     }
+
+    const aiData = await aiResponse.json();
+    const content = aiData.choices?.[0]?.message?.content;
     
-    const pathParts = urlParts[1].split('/');
-    const bucketName = pathParts[0];
-    const filePath = pathParts.slice(1).join('/');
-    
-    console.log(`Downloading from bucket: ${bucketName}, path: ${filePath}`);
-    
-    // Download the file using service role
-    const { data, error } = await supabase.storage
-      .from(bucketName)
-      .download(filePath);
-    
-    if (error) {
-      console.error('Error downloading file:', error);
+    if (!content) {
+      console.error(`No content in AI response for batch`);
       return null;
     }
-    
-    // Convert blob to base64
-    const arrayBuffer = await data.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
-    let binary = '';
-    for (let i = 0; i < uint8Array.length; i++) {
-      binary += String.fromCharCode(uint8Array[i]);
+
+    let result;
+    try {
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        result = JSON.parse(jsonMatch[0]);
+      } else {
+        result = JSON.parse(content);
+      }
+    } catch (parseError) {
+      console.error(`Failed to parse AI response for batch:`, content);
+      return null;
     }
-    const base64 = btoa(binary);
-    
-    return `data:image/jpeg;base64,${base64}`;
+
+    return {
+      matchedUserId: result.matchedUserId || null,
+      confidence: typeof result.confidence === "number" ? result.confidence : 0,
+      reason: result.reason || ""
+    };
   } catch (error) {
-    console.error('Error converting image to base64:', error);
+    console.error("Error in compareBatch:", error);
+    return null;
+  }
+}
+
+// Compare a batch of candidates using Google Gemini API directly
+async function compareBatchDirect(
+  capturedImage: string,
+  candidates: Candidate[],
+  geminiApiKey: string
+): Promise<{ matchedUserId: string | null; confidence: number; reason: string } | null> {
+  try {
+    const parts = [
+      {
+        text: `You are an extremely accurate face recognition system.
+Determine if the person in the "Captured Face" is the same person as one of the "Candidate Faces".
+
+Instructions:
+1. Examine the "Captured Face" image (labeled below).
+2. Examine the "Candidate Face" images (labeled below with their User IDs).
+3. Identify which Candidate Face (if any) is the same person as the Captured Face.
+4. Respond in JSON format only with:
+   - "matchedUserId": the User ID of the matching candidate, or null if no match is found.
+   - "confidence": confidence score from 0 to 100.
+   - "reason": brief explanation of why they match or why no match was found.
+
+IMPORTANT: Only return the JSON object, no other text.`
+      },
+      {
+        text: "=== Captured Face ==="
+      }
+    ];
+
+    // Add captured image as base64 inlineData
+    const capturedBase64Data = capturedImage.split(",")[1];
+    parts.push({
+      inlineData: {
+        mimeType: "image/jpeg",
+        data: capturedBase64Data
+      }
+    } as any);
+
+    // Fetch and download each candidate image in the batch to send as inlineData
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      parts.push({
+        text: `=== Candidate Face (User ID: ${candidate.user_id}) ===`
+      } as any);
+
+      try {
+        const res = await fetch(candidate.signedUrl);
+        if (res.ok) {
+          const arrayBuffer = await res.arrayBuffer();
+          const uint8Array = new Uint8Array(arrayBuffer);
+          let binary = '';
+          for (let k = 0; k < uint8Array.length; k++) {
+            binary += String.fromCharCode(uint8Array[k]);
+          }
+          const base64 = btoa(binary);
+          parts.push({
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: base64
+            }
+          } as any);
+        } else {
+          console.error(`Failed to fetch image for candidate ${candidate.full_name}`);
+        }
+      } catch (err) {
+        console.error(`Error downloading candidate image ${candidate.full_name}:`, err);
+      }
+    }
+
+    const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${geminiApiKey}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: parts
+          }
+        ],
+        generationConfig: {
+          responseMimeType: "application/json"
+        }
+      }),
+    });
+
+    if (!aiResponse.ok) {
+      const errorText = await aiResponse.text();
+      console.error(`Gemini Direct API batch error:`, errorText);
+      return null;
+    }
+
+    const aiData = await aiResponse.json();
+    const content = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!content) {
+      console.error(`No content in Gemini response`);
+      return null;
+    }
+
+    let result;
+    try {
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        result = JSON.parse(jsonMatch[0]);
+      } else {
+        result = JSON.parse(content);
+      }
+    } catch (parseError) {
+      console.error(`Failed to parse Gemini response:`, content);
+      return null;
+    }
+
+    return {
+      matchedUserId: result.matchedUserId || null,
+      confidence: typeof result.confidence === "number" ? result.confidence : 0,
+      reason: result.reason || ""
+    };
+  } catch (error) {
+    console.error("Error in compareBatchDirect:", error);
     return null;
   }
 }
 
 serve(async (req) => {
-  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
@@ -67,12 +259,10 @@ serve(async (req) => {
 
     console.log("Received face scan attendance request");
 
-    // Initialize Supabase client with service role for admin access
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Get all profiles with face images
     const { data: profiles, error: profilesError } = await supabase
       .from("profiles")
       .select("user_id, full_name, enrollment_number, roll_number, face_image_url")
@@ -82,172 +272,126 @@ serve(async (req) => {
       console.error("Error fetching profiles:", profilesError);
       return new Response(
         JSON.stringify({ status: "failed", reason: "database_error", message: "Failed to fetch profiles" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     if (!profiles || profiles.length === 0) {
       return new Response(
         JSON.stringify({ status: "failed", reason: "no_registered_faces", message: "No registered faces in the system" }),
-        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
     console.log(`Found ${profiles.length} profiles with face images`);
 
-    // Use Lovable AI to compare faces
+    // Verify AI Credentials (either Lovable AI Gateway key or direct Google Gemini API key)
     const lovableApiKey = Deno.env.get("LOVABLE_API_KEY");
-    if (!lovableApiKey) {
-      console.error("LOVABLE_API_KEY not configured");
+    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
+
+    if (!lovableApiKey && !geminiApiKey) {
+      console.error("Neither LOVABLE_API_KEY nor GEMINI_API_KEY is configured");
       return new Response(
-        JSON.stringify({ status: "failed", reason: "config_error", message: "AI service not configured" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    let matchedProfile = null;
-    let highestConfidence = 0;
-    let hadRateLimitError = false;
-
-    // Compare captured face with each registered face
-    for (const profile of profiles) {
-      if (!profile.face_image_url) continue;
-
-      try {
-        console.log(`Comparing with profile: ${profile.full_name}`);
-        
-        // Download and convert stored face image to base64
-        const storedFaceBase64 = await getImageAsBase64(supabase, profile.face_image_url);
-        if (!storedFaceBase64) {
-          console.error(`Failed to get base64 for profile ${profile.full_name}`);
-          continue;
-        }
-        
-        console.log(`Successfully converted image for ${profile.full_name}`);
-        
-        const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${lovableApiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "google/gemini-2.5-flash",
-            messages: [
-              {
-                role: "system",
-                content: `You are a face recognition system. Compare two face images and determine if they are the same person.
-                
-                Analyze facial features including:
-                - Face shape and structure
-                - Eye shape, size, and positioning
-                - Nose shape and size
-                - Mouth and lip structure
-                - Overall facial proportions
-                
-                Account for differences in:
-                - Lighting conditions
-                - Camera angle
-                - Image quality
-                
-                Respond with a JSON object containing:
-                - "match": true or false
-                - "confidence": a number from 0 to 100 representing how confident you are
-                - "reason": brief explanation
-                
-                IMPORTANT: Only return the JSON object, no other text.`
-              },
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: "Compare these two face images and determine if they are the same person. Image 1 is the captured image, Image 2 is the registered face."
-                  },
-                  {
-                    type: "image_url",
-                    image_url: { url: capturedImage }
-                  },
-                  {
-                    type: "image_url",
-                    image_url: { url: storedFaceBase64 }
-                  }
-                ]
-              }
-            ],
-          }),
-        });
-
-        if (!aiResponse.ok) {
-          const errorText = await aiResponse.text();
-          console.error(`AI API error for profile ${profile.full_name}:`, errorText);
-
-          try {
-            const parsedError = JSON.parse(errorText);
-            if (parsedError?.type === "rate_limited" || parsedError?.error?.type === "rate_limited") {
-              hadRateLimitError = true;
-            }
-          } catch (_) {
-            // Ignore JSON parse errors, keep generic logging
-          }
-
-          continue;
-        }
-
-        const aiData = await aiResponse.json();
-        const content = aiData.choices?.[0]?.message?.content;
-        
-        if (!content) {
-          console.error(`No content in AI response for profile ${profile.full_name}`);
-          continue;
-        }
-
-        // Parse the JSON response
-        let result;
-        try {
-          // Handle potential markdown code blocks
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            result = JSON.parse(jsonMatch[0]);
-          } else {
-            result = JSON.parse(content);
-          }
-        } catch (parseError) {
-          console.error(`Failed to parse AI response for profile ${profile.full_name}:`, content);
-          continue;
-        }
-
-        console.log(`Match result for ${profile.full_name}:`, result);
-
-        if (result.match && result.confidence > highestConfidence) {
-          highestConfidence = result.confidence;
-          matchedProfile = profile;
-        }
-      } catch (error) {
-        console.error(`Error comparing with profile ${profile.full_name}:`, error);
-        continue;
-      }
-    }
-
-    // Threshold for a valid match
-    const CONFIDENCE_THRESHOLD = 70;
-
-    // If we were rate limited and couldn't compare, surface that explicitly
-    if (hadRateLimitError && highestConfidence === 0) {
-      console.log("AI rate limited during face comparison");
-
-      return new Response(
-        JSON.stringify({
-          status: "failed",
-          reason: "rate_limited",
-          message: "Face recognition service is temporarily busy. Please try again in a minute.",
-          confidence: highestConfidence,
-        }),
+        JSON.stringify({ status: "failed", reason: "config_error", message: "AI service credentials not configured on server" }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    if (!matchedProfile || highestConfidence < CONFIDENCE_THRESHOLD) {
+    const pathMap = new Map();
+    const paths: string[] = [];
+
+    for (const profile of profiles) {
+      if (!profile.face_image_url) continue;
+      
+      const urlParts = profile.face_image_url.split('/storage/v1/object/public/face-images/');
+      if (urlParts.length === 2) {
+        const path = urlParts[1];
+        paths.push(path);
+        pathMap.set(path, profile);
+      } else {
+        console.warn('Profile face_image_url not in standard face-images bucket format:', profile.face_image_url);
+      }
+    }
+
+    const profilesWithUrls: Candidate[] = [];
+    if (paths.length > 0) {
+      console.log(`Generating signed URLs for ${paths.length} files...`);
+      const { data: signedUrlsData, error: signedUrlsError } = await supabase.storage
+        .from('face-images')
+        .createSignedUrls(paths, 300);
+
+      if (signedUrlsError) {
+        console.error("Error creating signed URLs:", signedUrlsError);
+        return new Response(
+          JSON.stringify({ status: "failed", reason: "storage_error", message: "Failed to generate access to face images" }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      if (signedUrlsData) {
+        for (const item of signedUrlsData) {
+          if (item.error) {
+            console.error(`Error signing URL for path ${item.path}:`, item.error);
+            continue;
+          }
+          const profile = pathMap.get(item.path);
+          if (profile && item.signedUrl) {
+            profilesWithUrls.push({
+              user_id: profile.user_id,
+              full_name: profile.full_name,
+              enrollment_number: profile.enrollment_number,
+              roll_number: profile.roll_number,
+              signedUrl: item.signedUrl
+            });
+          }
+        }
+      }
+    }
+
+    if (profilesWithUrls.length === 0) {
+      return new Response(
+        JSON.stringify({ status: "failed", reason: "no_registered_faces", message: "No valid registered faces in the system" }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    console.log(`Successfully generated signed URLs for ${profilesWithUrls.length} candidates`);
+
+    const batchSize = 15;
+    const batches: Candidate[][] = [];
+    for (let i = 0; i < profilesWithUrls.length; i += batchSize) {
+      batches.push(profilesWithUrls.slice(i, i + batchSize));
+    }
+
+    console.log(`Running comparison across ${batches.length} parallel batches...`);
+
+    const batchPromises = batches.map(batch => {
+      if (geminiApiKey) {
+        // Use direct Google Gemini API call
+        console.log("Using direct Google Gemini API...");
+        return compareBatchDirect(capturedImage, batch, geminiApiKey);
+      } else {
+        // Fall back to Lovable AI Gateway
+        console.log("Using Lovable AI Gateway...");
+        return compareBatch(capturedImage, batch, lovableApiKey!);
+      }
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+
+    let matchedUserId: string | null = null;
+    let highestConfidence = 0;
+
+    for (const result of batchResults) {
+      if (result && result.matchedUserId && result.confidence > highestConfidence) {
+        highestConfidence = result.confidence;
+        matchedUserId = result.matchedUserId;
+      }
+    }
+
+    const CONFIDENCE_THRESHOLD = 70;
+
+    if (!matchedUserId || highestConfidence < CONFIDENCE_THRESHOLD) {
       console.log(`No match found. Highest confidence: ${highestConfidence}`);
 
       return new Response(
@@ -261,7 +405,16 @@ serve(async (req) => {
       );
     }
 
-    // Check for duplicate attendance today
+    const matchedProfile = profiles.find(p => p.user_id === matchedUserId);
+
+    if (!matchedProfile) {
+      console.error(`Matched user ID ${matchedUserId} but profile not found in initial fetch`);
+      return new Response(
+        JSON.stringify({ status: "failed", reason: "server_error", message: "An unexpected error occurred" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -290,7 +443,6 @@ serve(async (req) => {
       );
     }
 
-    // Mark attendance
     const { error: insertError } = await supabase.from("attendance_records").insert({
       user_id: matchedProfile.user_id,
       status: "present",
@@ -304,7 +456,7 @@ serve(async (req) => {
       console.error("Error inserting attendance:", insertError);
       return new Response(
         JSON.stringify({ status: "failed", reason: "database_error", message: "Failed to mark attendance" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
