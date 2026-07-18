@@ -3,13 +3,16 @@ import { Users, BookOpen, AlertCircle, LogOut, User, TrendingUp } from 'lucide-r
 import DashboardCard from '@/components/DashboardCard';
 import { toast } from 'sonner';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '@/hooks/useAuth';
 
 const TeacherDashboard = () => {
   const navigate = useNavigate();
+  const { signOut } = useAuth();
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await signOut();
     toast.success('Logged out successfully');
-    navigate('/login');
+    navigate('/auth', { replace: true });
   };
 
   return (
