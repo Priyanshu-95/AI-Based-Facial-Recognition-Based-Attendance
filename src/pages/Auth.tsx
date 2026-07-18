@@ -51,9 +51,19 @@ const Auth = () => {
   const [capturedFaceBlob, setCapturedFaceBlob] = useState<Blob | null>(null);
 
   useEffect(() => {
-    if (user && !loading) {
-      navigate('/student/dashboard');
-    }
+    const routeByRole = async () => {
+      if (!user || loading) return;
+      const { data } = await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      const role = data?.role;
+      if (role === 'admin') navigate('/admin/dashboard');
+      else if (role === 'teacher') navigate('/teacher/dashboard');
+      else navigate('/student/dashboard');
+    };
+    routeByRole();
   }, [user, loading, navigate]);
 
   const handleLogin = async (e: React.FormEvent) => {
